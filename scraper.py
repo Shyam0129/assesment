@@ -9,15 +9,15 @@ import json
 import time
 import logging
 import argparse
+from dotenv import load_dotenv
 from typing import Dict, Optional, List
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from webdriver_manager.chrome import ChromeDriverManager
 from utils import scroll_to_load_content, safe_extract_text, setup_logger
 
 # Setup logging
@@ -54,9 +54,10 @@ class LinkedInScraper:
         chrome_options.add_experimental_option('useAutomationExtension', False)
         chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         
-        # Initialize driver
-        service = Service(ChromeDriverManager().install())
-        self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        
+        # Initialize driver with Selenium's built-in driver manager
+        self.driver = webdriver.Chrome(options=chrome_options)
+        self.driver.maximize_window() # Maximize window to ensure better rendering
         self.wait = WebDriverWait(self.driver, 15)
         
         logger.info("WebDriver setup complete")
@@ -64,7 +65,7 @@ class LinkedInScraper:
     def login(self, email: str, password: str):
         """
         Login to LinkedIn
-        
+         
         Args:
             email: LinkedIn email
             password: LinkedIn password
@@ -130,205 +131,245 @@ class LinkedInScraper:
         """Extract profile name"""
         logger.info("Extracting name...")
         
-        selectors = [
+        # Wait for main content to load
+        try:
+            self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "main")))
+            time.sleep(2)
+        except:
+            pass
+        
+        # Try LinkedIn's current structure first
+        name_selectors = [
+            "div.f0a6b000.e60f223a.a92e7eaf h1",  # Current LinkedIn structure
             "h1.text-heading-xlarge",
-            "h1.inline.t-24.v-align-middle.break-words",
-            "div.ph5 h1",
+            "section div h1",
             "h1"
         ]
         
-        for selector in selectors:
-            name = safe_extract_text(self.driver, By.CSS_SELECTOR, selector, logger)
-            if name and name != "Not available":
-                logger.info(f"Name found: {name}")
-                return name
-                
+        for selector in name_selectors:
+            try:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                for elem in elements:
+                    text = elem.text.strip()
+                    if text and len(text) > 2 and not text.startswith("·"):
+                        logger.info(f"Name found: {text}")
+                        return text
+            except Exception as e:
+                logger.debug(f"Selector {selector} failed: {e}")
+        
+        # Fallback: Extract from page title
+        try:
+            page_title = self.driver.title
+            if " | LinkedIn" in page_title:
+                title_name = page_title.split(" | LinkedIn")[0].strip()
+                logger.info(f"Name from page title: {title_name}")
+                return title_name
+        except:
+            pass
+        
         logger.warning("Name not found")
         return "Not available"
         
     def extract_about(self) -> str:
         """Extract About section text"""
         logger.info("Extracting About section...")
-        
         try:
-            # Try to find and click "Show more" button first
+            time.sleep(1)
+            
+            about_text = "Not available"
+            
+            # Strategy: Find section with "About" header using robust XPath
             try:
-                show_more = self.driver.find_element(
-                    By.CSS_SELECTOR, 
-                    "div#about ~ div button[aria-expanded='false']"
-                )
-                self.driver.execute_script("arguments[0].click();", show_more)
-                time.sleep(1)
-            except:
-                pass
+                # 1. Try id="about" which is often an anchor
+                targets = [
+                    "//section[@id='about']",
+                    "//div[@id='about']/ancestor::section",
+                    "//section[.//h2[normalize-space()='About']]",
+                    "//section[.//span[normalize-space()='About']]"
+                ]
+                
+                target_section = None
+                for xpath in targets:
+                    try:
+                        secs = self.driver.find_elements(By.XPATH, xpath)
+                        if secs:
+                            target_section = secs[0]
+                            break
+                    except:
+                        continue
+                
+                if target_section:
+                    # Look for text content
+                    try:
+                        btn = target_section.find_element(By.CSS_SELECTOR, "button.inline-show-more-text__button")
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(0.5)
+                    except:
+                        pass
+                        
+                    # Get text from generic container or specific class
+                    try:
+                        t = target_section.find_element(By.XPATH, ".//div[contains(@class, 'display-flex')]//span[@aria-hidden='true']").text
+                        if len(t) > 20: about_text = t
+                    except:
+                        about_text = target_section.text.replace("About", "").replace("Show more", "").strip()
             
-            selectors = [
-                "div#about ~ div span[aria-hidden='true']",
-                "section.artdeco-card div.display-flex.ph5.pv3 div.inline-show-more-text span[aria-hidden='true']",
-                "div.pv-about-section div.pv-about__summary-text",
-                "section.summary div.pv-about__summary-text"
-            ]
+            except Exception as e:
+                logger.debug(f"About xpath strategy failed: {e}")
+
+            # Clean up text
+            if about_text != "Not available":
+                 lines = [l.strip() for l in about_text.split('\n') if l.strip() and l.lower() not in ["show less", "show more"]]
+                 if len(lines) == 1 and "|" in lines[0] and len(lines[0]) < 100:
+                     logger.warning("Extracted text looks like headline, ignoring.")
+                     about_text = "Not available"
+                 else:
+                     about_text = " ".join(lines)
+                     logger.info(f"About section found ({len(about_text)} chars)")
             
-            for selector in selectors:
-                about = safe_extract_text(self.driver, By.CSS_SELECTOR, selector, logger)
-                if about and about != "Not available":
-                    logger.info("About section found")
-                    return about
-                    
+            return about_text
+
         except Exception as e:
-            logger.warning(f"Error extracting about section: {str(e)}")
-            
-        logger.warning("About section not found")
-        return "Not available"
-        
+            logger.error(f"Error extracting about: {str(e)}")
+            return "Not available"
+
     def check_open_to_work(self) -> bool:
         """Check if profile has 'Open to Work' badge"""
         logger.info("Checking 'Open to Work' status...")
-        
         try:
-            selectors = [
-                "img[alt*='Open to work']",
-                "div.pv-top-card-profile-picture__container img[alt*='Open to work']",
-                "span:contains('Open to work')",
-                "div.artdeco-entity-lockup__badge-text"
+            xpaths = [
+                "//*[contains(text(), 'Open to work') or contains(text(), 'OPEN TO WORK')]",
+                "//img[contains(@alt, 'Open to work')]",
+                "//section[.//span[contains(text(), 'Open to work')]]",
+                "//main//section//div[contains(@class, 'pv-top-card__badge-wrap')]"
             ]
             
-            for selector in selectors:
+            for xpath in xpaths:
                 try:
-                    self.driver.find_element(By.CSS_SELECTOR, selector)
-                    logger.info("Open to work: True")
-                    return True
-                except NoSuchElementException:
+                    elements = self.driver.find_elements(By.XPATH, xpath)
+                    if elements:
+                        logger.info(f"Open to work found via XPath: {xpath}")
+                        return True
+                except:
                     continue
-                    
-        except Exception as e:
-            logger.warning(f"Error checking open to work status: {str(e)}")
             
-        logger.info("Open to work: False")
-        return False
-        
+            return False
+        except Exception as e:
+            logger.error(f"Error checking Open to Work: {str(e)}")
+            return False
+
     def extract_experience(self) -> Dict[str, any]:
         """
         Extract experience data including companies and previous company
-        
-        Returns:
-            Dictionary with 'companies', 'total_companies', and 'previous_company'
         """
         logger.info("Extracting experience data...")
         
         companies = []
-        previous_company = "Not available"
+        current_companies = []
+        previous_company_field = "Not available"
         
         try:
-            # Try to find and click "Show all experiences" button
-            try:
-                show_all = self.driver.find_element(
-                    By.CSS_SELECTOR,
-                    "div#experience ~ div button[aria-label*='Show all']"
-                )
-                self.driver.execute_script("arguments[0].click();", show_all)
-                time.sleep(2)
-            except:
-                pass
+            time.sleep(2)
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight / 2);")
+            time.sleep(2)
             
-            # Find experience section
-            experience_selectors = [
-                "section#experience-section ul.pv-profile-section__section-info li",
-                "div#experience ~ div ul li.artdeco-list__item",
-                "section.experience-section ul li"
+            # Universal Strategy: Parse Body Text
+            body_text = self.driver.find_element(By.TAG_NAME, "body").text
+            
+            start_markers = ["Experience\n", "Work Experience\n"]
+            start_idx = -1
+            for marker in start_markers:
+                idx = body_text.find(marker)
+                if idx != -1:
+                    start_idx = idx
+                    logger.info(f"Found Experience start at {start_idx}")
+                    break
+            
+            lines = []
+            if start_idx != -1:
+                end_markers = ["Education\n", "Education", "Projects\n", "Skills\n", "Licenses", "Volunteering"]
+                end_idx = start_idx + 5000 
+                
+                search_text = body_text[start_idx+15:]
+                candidates = []
+                for m in end_markers:
+                    i = search_text.find(m)
+                    if i != -1: candidates.append(i)
+                
+                if candidates:
+                    end_idx = min(candidates) + start_idx + 15
+                else:
+                    end_idx = min(len(body_text), start_idx + 3000)
+                
+                section_text = body_text[start_idx:end_idx]
+                lines = [l.strip() for l in section_text.split('\n') if l.strip()]
+            else:
+                logger.warning("Experience header not found in text.")
+
+            # Filter Noise
+            noise_keywords = [
+                "mos", "yr", "present", "full-time", "contract", "internship", "experience",
+                "india", "united states", "kingdom", "germany", "canada", "remote", "hybrid", "on-site",
+                "jan ", "feb ", "mar ", "apr ", "may ", "jun ", "jul ", "aug ", "sep ", "oct ", "nov ", "dec ",
+                "bangalore", "bengaluru", "hyderabad", "delhi", "mumbai", "karnataka", "telangana", "maharashtra"
             ]
             
-            experience_items = []
-            for selector in experience_selectors:
+            last_company = None
+            
+            for line in lines:
+                # Identify Company using Separator
+                if "·" in line or "•" in line:
+                     sep = "·" if "·" in line else "•"
+                     cand = line.split(sep)[0].strip()
+                     
+                     if len(cand) >= 2:
+                         is_noise = False
+                         if any(x in cand.lower() for x in noise_keywords): is_noise = True
+                         if any(char.isdigit() for char in cand) and len(cand) < 10: is_noise = True
+                         
+                         if not is_noise:
+                             if cand not in companies:
+                                 companies.append(cand)
+                                 logger.info(f"Added company: {cand}")
+                                 last_company = cand
+                             else:
+                                 last_company = cand # Update context if company appears again
+
+                # Identify if current ("Present")
+                if "Present" in line or "present" in line:
+                    if last_company and last_company not in current_companies:
+                        current_companies.append(last_company)
+                        logger.info(f"Marked {last_company} as current")
+
+
+            # Fallback: Check Headline
+            if not companies:
+                logger.info("Checking Headline for company info...")
                 try:
-                    experience_items = self.driver.find_elements(By.CSS_SELECTOR, selector)
-                    if experience_items:
-                        break
-                except:
-                    continue
-            
-            if not experience_items:
-                logger.warning("No experience items found")
-                return {
-                    "companies": [],
-                    "total_companies": 0,
-                    "previous_company": "Not available"
-                }
-            
-            current_date_found = False
-            
-            for item in experience_items:
-                try:
-                    # Extract company name
-                    company_selectors = [
-                        "span.t-14.t-normal span[aria-hidden='true']",
-                        "span.pv-entity__secondary-title",
-                        "p.pv-entity__secondary-title",
-                        "span[aria-hidden='true']"
-                    ]
-                    
-                    company_name = None
-                    for comp_sel in company_selectors:
-                        try:
-                            company_elem = item.find_element(By.CSS_SELECTOR, comp_sel)
-                            company_name = company_elem.text.strip()
-                            if company_name and not company_name.startswith("·"):
-                                break
-                        except:
-                            continue
-                    
-                    if not company_name:
-                        continue
-                    
-                    # Extract date range to determine if current or past
-                    date_selectors = [
-                        "span.t-14.t-normal.t-black--light span[aria-hidden='true']",
-                        "span.pv-entity__date-range span:nth-child(2)",
-                        "p.pv-entity__date-range span:nth-child(2)"
-                    ]
-                    
-                    date_range = None
-                    for date_sel in date_selectors:
-                        try:
-                            date_elem = item.find_element(By.CSS_SELECTOR, date_sel)
-                            date_range = date_elem.text.strip().lower()
-                            if date_range:
-                                break
-                        except:
-                            continue
-                    
-                    # Add to companies list
-                    if company_name not in companies:
-                        companies.append(company_name)
-                    
-                    # Determine if this is a current or past role
-                    is_current = date_range and ("present" in date_range or "current" in date_range)
-                    
-                    # If we haven't found a current role yet and this is past, it's previous
-                    if not current_date_found and not is_current and previous_company == "Not available":
-                        previous_company = company_name
-                    
-                    if is_current:
-                        current_date_found = True
-                        # Reset previous company if we found current role
-                        if previous_company != "Not available":
-                            # Re-scan for actual previous (second in list after current)
-                            pass
-                        
+                    headline_candidates = [l for l in body_text.split('\n')[:20] if "@" in l]
+                    for head in headline_candidates:
+                        if " @ " in head:
+                            parts = head.split(" @ ")
+                            if len(parts) > 1:
+                                company = parts[1].split("|")[0].split("-")[0].split(",")[0].strip()
+                                if len(company) > 2:
+                                    companies.append(company)
+                                    current_companies.append(company) # Headline implies current
+                                    logger.info(f"Extracted company from Headline: {company}")
+                                    break
                 except Exception as e:
-                    logger.debug(f"Error processing experience item: {str(e)}")
-                    continue
-            
-            # If we have companies but no previous company identified, use first non-current
-            if companies and previous_company == "Not available":
-                # If there's more than one company, second one is likely previous
-                if len(companies) > 1:
-                    previous_company = companies[1]
-                elif len(companies) == 1:
-                    previous_company = companies[0]
-            
+                    logger.debug(f"Headline fallback failed: {e}")
+
+            # Determine previous_company field (which now holds LATEST companies)
+            if current_companies:
+                # Join with commas if multiple
+                previous_company_field = ", ".join(current_companies)
+            elif companies:
+                # Default to the first one found (usually most recent)
+                previous_company_field = companies[0]
+
             logger.info(f"Total companies: {len(companies)}")
-            logger.info(f"Previous company: {previous_company}")
+            logger.info(f"Latest/Current company(s): {previous_company_field}")
             
         except Exception as e:
             logger.error(f"Error extracting experience: {str(e)}")
@@ -336,7 +377,7 @@ class LinkedInScraper:
         return {
             "companies": companies,
             "total_companies": len(companies),
-            "previous_company": previous_company
+            "previous_company": previous_company_field # This maps to desired logic
         }
         
     def scrape_profile(self, profile_input: str) -> Dict:
@@ -369,7 +410,7 @@ class LinkedInScraper:
                 "name": name,
                 "about": about,
                 "open_to_work": open_to_work,
-                "previous_company": experience_data["previous_company"],
+                "previous_company": experience_data["previous_company"], # Holds LATEST/CURRENT
                 "total_companies_worked": experience_data["total_companies"],
                 "companies_list": experience_data["companies"]
             }
@@ -394,53 +435,35 @@ class LinkedInScraper:
 def main():
     """Main execution function"""
     
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(
-        description="LinkedIn Profile Scraper - Extract profile information using Selenium"
-    )
-    parser.add_argument(
-        "--profile",
-        required=True,
-        help="LinkedIn profile ID or full URL (e.g., 'johndoe' or 'https://www.linkedin.com/in/johndoe/')"
-    )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run browser in headless mode (not recommended for LinkedIn)"
-    )
+    load_dotenv()
+    
+    parser = argparse.ArgumentParser(description="LinkedIn Profile Scraper")
+    parser.add_argument("--profile", required=True)
+    parser.add_argument("--headless", action="store_true")
     
     args = parser.parse_args()
     
-    # Get credentials from environment variables
     email = os.getenv("LINKEDIN_EMAIL")
     password = os.getenv("LINKEDIN_PASSWORD")
     
     if not email or not password:
         logger.error("LinkedIn credentials not found in environment variables!")
-        logger.error("Please set LINKEDIN_EMAIL and LINKEDIN_PASSWORD")
         sys.exit(1)
     
     scraper = None
     
     try:
-        # Initialize scraper
         scraper = LinkedInScraper(headless=args.headless)
         scraper.setup_driver()
-        
-        # Login
         scraper.login(email, password)
-        
-        # Scrape profile
         results = scraper.scrape_profile(args.profile)
         
-        # Output results
         print("\n" + "=" * 60)
         print("SCRAPING RESULTS")
         print("=" * 60)
         print(json.dumps(results, indent=2))
         print("=" * 60)
         
-        # Save to file
         output_file = "output.json"
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
@@ -448,13 +471,11 @@ def main():
         logger.info(f"Results saved to {output_file}")
         
     except KeyboardInterrupt:
-        logger.info("Scraping interrupted by user")
+        logger.info("Scraping interrupted")
         sys.exit(0)
-        
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
         sys.exit(1)
-        
     finally:
         if scraper:
             scraper.close()
